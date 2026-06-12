@@ -291,7 +291,7 @@ static void gpu_send(void *req, int req_len);
 // ── GPU command helpers ───────────────────────────────────────────────
 
 // Send RESOURCE_DETACH_BACKING for the display resource.
-static void __attribute__((unused))
+static void
 gpu_cmd_detach(void)
 {
     static struct virtio_gpu_resource_detach_backing detach;
@@ -546,6 +546,68 @@ void virtio_gpu_init(void)
 void virtio_gpu_commit(void)
 {
     gpu_transfer_flush();
+}
+
+// ── Public: map kernel framebuffer pages into a user page table ────────
+// Maps all FB_PAGES of fb[] at consecutive pages starting at va with
+// PTE_U|PTE_R|PTE_W.  Caller must have verified va is page-aligned and
+// the range is collision-free.  Returns 0 on success, -1 on OOM.
+int
+virtio_gpu_map_fb(pagetable_t pagetable, uint64 va)
+{
+    for (int i = 0; i < FB_PAGES; i++) {
+        if (mappages(pagetable, va + (uint64)i * PGSIZE, PGSIZE,
+                     (uint64)fb[i], PTE_U | PTE_R | PTE_W) != 0) {
+            if (i > 0)
+                uvmunmap(pagetable, va, i, 0);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+// ── Flip owner tracking ────────────────────────────────────────────────
+// When a process calls flip_display, the GPU device's backing is re-pointed
+// to that process's user pages.  We record the owner so that when it exits
+// we can restore the device to the kernel's fb[] and avoid reading from
+// freed pages.
+static struct proc *flip_owner;
+
+// ── Public: zero-copy page flip ────────────────────────────────────────
+// Detaches the current backing and re-attaches the device to the
+// physical pages in phys_pages[0..n-1].
+void
+virtio_gpu_flip(uint64 *phys_pages, int n)
+{
+    static struct virtio_gpu_mem_entry entries[FB_PAGES];
+    for (int i = 0; i < n; i++) {
+        entries[i].addr    = phys_pages[i];
+        entries[i].length  = PGSIZE;
+        entries[i].padding = 0;
+    }
+    gpu_cmd_detach();
+    gpu_cmd_attach(entries, n);
+    flip_owner = myproc();
+}
+
+// ── Public: called when a process exits ───────────────────────────────
+// If p was the process backing the GPU via flip_display, restore the
+// device's backing to the kernel's own fb[] so the daemon can keep
+// flushing valid pixel data.
+void
+virtio_gpu_on_proc_exit(struct proc *p)
+{
+    if (flip_owner != p)
+        return;
+    flip_owner = 0;
+    static struct virtio_gpu_mem_entry fb_entries[FB_PAGES];
+    for (int i = 0; i < FB_PAGES; i++) {
+        fb_entries[i].addr   = (uint64)fb[i];
+        fb_entries[i].length = PGSIZE;
+        fb_entries[i].padding = 0;
+    }
+    gpu_cmd_detach();
+    gpu_cmd_attach(fb_entries, FB_PAGES);
 }
 
 // ── GPU daemon ────────────────────────────────────────────────────────

@@ -126,6 +126,11 @@ exec(char *path, char **argv)
   p->sz = sz;
   p->trapframe->epc = elf.entry;  // initial program counter = main
   p->trapframe->sp = sp; // initial stack pointer
+  // Remove any GPU framebuffer mapping from the old page table before freeing.
+  if(p->fb_map_va) {
+    uvmunmap(oldpagetable, p->fb_map_va, GPU_FB_PAGES, 0);
+    p->fb_map_va = 0;
+  }
   proc_freepagetable(oldpagetable, oldsz);
 
   return argc; // this ends up in a0, the first argument to main(argc, argv)

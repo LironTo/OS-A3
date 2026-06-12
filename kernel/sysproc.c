@@ -92,29 +92,72 @@ sys_uptime(void)
 
 // sys_flip_display: zero-copy page flip.
 //
-// Syscall argument 0: user virtual address of a page-aligned buffer
-// that is exactly GPU_FB_PAGES (300) * PGSIZE bytes (i.e. 640x480x4 =
-// 1,228,800 bytes).  The buffer must already be fully mapped in the
-// calling process's address space.
-//
-// TODO: Students implement this syscall.
+// Re-points the GPU resource's backing pages to the physical pages
+// underlying the user buffer buf.  No pixel data is copied.
+// buf must be page-aligned and all GPU_FB_PAGES pages must be mapped
+// with user permission.  Returns 0 on success, -1 on error.
 uint64
 sys_flip_display(void)
 {
-  return -1;
+  uint64 buf;
+  argaddr(0, &buf);
+
+  struct proc *p = myproc();
+
+  if (buf % PGSIZE != 0)
+    return -1;
+
+  // Walk the user page table to collect physical addresses for each page.
+  uint64 phys_pages[GPU_FB_PAGES];
+  for (int i = 0; i < GPU_FB_PAGES; i++) {
+    uint64 va = buf + (uint64)i * PGSIZE;
+    // walkaddr verifies PTE_V | PTE_U; returns 0 if not mapped or no user perm
+    uint64 pa = walkaddr(p->pagetable, va);
+    if (pa == 0)
+      return -1;
+    phys_pages[i] = pa;
+  }
+
+  virtio_gpu_flip(phys_pages, GPU_FB_PAGES);
+  return 0;
 }
 
 // sys_map_display: map the GPU's kernel framebuffer pages (fb[]) directly
 // into the calling process's address space with PTE_U|PTE_R|PTE_W.
 //
-// Syscall argument 0: desired user virtual address (must be page-aligned).
-//   Pass 0 to let the kernel auto-select the next available VA above p->sz.
-//
-// Returns the mapped virtual address on success, (uint64)-1 on failure.
-//
-// TODO: Students implement this syscall.
+// Argument 0: desired virtual address (page-aligned), or 0 to let the
+// kernel auto-select a free VA above p->sz.
+// Returns the mapped VA on success, (uint64)-1 on failure.
 uint64
 sys_map_display(void)
 {
-  return -1;
+  uint64 addr;
+  argaddr(0, &addr);
+
+  struct proc *p = myproc();
+
+  if (addr == 0) {
+    // Auto-select: first page-aligned VA above the current heap.
+    addr = PGROUNDUP(p->sz);
+  } else {
+    if (addr % PGSIZE != 0)
+      return -1;
+  }
+
+  // The entire region must fit below the trapframe.
+  if (addr + (uint64)GPU_FB_PAGES * PGSIZE > TRAPFRAME)
+    return -1;
+
+  // Verify that no page in the region is already mapped.
+  for (uint64 va = addr; va < addr + (uint64)GPU_FB_PAGES * PGSIZE; va += PGSIZE) {
+    pte_t *pte = walk(p->pagetable, va, 0);
+    if (pte && (*pte & PTE_V))
+      return -1;
+  }
+
+  if (virtio_gpu_map_fb(p->pagetable, addr) != 0)
+    return -1;
+
+  p->fb_map_va = addr;
+  return addr;
 }

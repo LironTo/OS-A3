@@ -202,5 +202,9 @@ int main(int argc, char *argv[])
         exit(1);
     }
 
+    // Keep the process alive long enough for the display daemon to flush
+    // the image.  Without this, exit() frees the buffer pages immediately
+    // and the device reads garbage (visible as a corrupted display).
+    sleep(30);
     exit(0);
 }

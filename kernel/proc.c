@@ -158,6 +158,12 @@ freeproc(struct proc *p)
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
+  // If this process backed the GPU via flip_display, restore the kernel fb[].
+  virtio_gpu_on_proc_exit(p);
+  // Unmap GPU framebuffer pages (do not free — they belong to the driver).
+  if(p->fb_map_va && p->pagetable)
+    uvmunmap(p->pagetable, p->fb_map_va, GPU_FB_PAGES, 0);
+  p->fb_map_va = 0;
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
