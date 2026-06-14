@@ -130,14 +130,8 @@ struct virtio_gpu_resource_detach_backing
 
 #define GPU_NUM 8
 
-// Serialises all virtqueue operations so the daemon and user syscalls
-// can coexist on multi-CPU systems.
 static struct spinlock gpu_lock;
-
-// Serialises flip_entries[] across concurrent virtio_gpu_flip / restore calls.
 static struct spinlock flip_lock;
-
-// Entry buffer for page-flip operations — avoids a ~4800-byte stack alloc.
 static struct virtio_gpu_mem_entry flip_entries[FB_PAGES];
 
 static struct
@@ -555,20 +549,12 @@ void virtio_gpu_commit(void)
     gpu_transfer_flush();
 }
 
-// ── Public: return the array of kernel framebuffer page pointers ──────
-// Each fb[i] is a kernel virtual address of one 4 KB page; there are
-// GPU_FB_PAGES (300) of them.  sys_map_display uses this to install the
-// pages into a user process's page table.
 void **
 virtio_gpu_fb_pages(void)
 {
     return fb;
 }
 
-// Re-point the GPU resource's backing pages to the FB_PAGES physical
-// addresses in phys_addrs[], then immediately commit to the display.
-// The synchronous flush is necessary because user programs like show_flip
-// exit right after calling flip_display, before the daemon's next tick.
 void
 virtio_gpu_flip(uint64 *phys_addrs, int n)
 {
@@ -584,9 +570,6 @@ virtio_gpu_flip(uint64 *phys_addrs, int n)
     release(&flip_lock);
 }
 
-// Restore the GPU resource's backing to the kernel framebuffer pages fb[].
-// Called from sys_exit when a process that used flip_display exits, so the
-// device does not keep reading freed user pages after the process dies.
 void
 virtio_gpu_restore_fb(void)
 {
