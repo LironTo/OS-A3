@@ -6,13 +6,22 @@
 #include "spinlock.h"
 #include "proc.h"
 
-// Expose the kernel framebuffer page array from virtio_gpu.c.
+// Functions exposed from virtio_gpu.c.
 extern void **virtio_gpu_fb_pages(void);
+extern void   virtio_gpu_flip(uint64 *phys_addrs, int n);
+extern void   virtio_gpu_restore_fb(void);
 
-// Per-process record of where the GPU framebuffer is mapped, indexed by
-// pid % NPROC.  0 means the framebuffer is not mapped for that slot.
-// Used by sys_exit to unmap before the page table is freed.
+// Per-process record of where the GPU framebuffer is mapped (map_display).
+// Indexed by pid % NPROC; 0 means not mapped.
 static uint64 fb_va_by_pid[NPROC];
+
+// Per-process flag: 1 if the GPU is currently backed by this process's
+// user pages (flip_display was called).  Indexed by pid % NPROC.
+static int flip_done_by_pid[NPROC];
+
+// Temporary physical-address buffer used by sys_flip_display.
+// Declared static to avoid a ~2400-byte stack allocation.
+static uint64 flip_phys_buf[GPU_FB_PAGES];
 
 uint64
 sys_exit(void)
@@ -20,14 +29,22 @@ sys_exit(void)
   int n;
   argint(0, &n);
 
-  // Unmap the GPU framebuffer before the page table is freed so that
-  // freewalk() does not panic on the dangling leaf PTEs.  do_free=0
-  // because the pages are kernel-owned (fb[] in virtio_gpu.c).
   struct proc *p = myproc();
   int idx = p->pid % NPROC;
+
+  // Unmap the GPU framebuffer before the page table is freed so that
+  // freewalk() does not panic on dangling leaf PTEs.  do_free=0 because
+  // the pages are kernel-owned (fb[] in virtio_gpu.c).
   if (fb_va_by_pid[idx] != 0) {
     uvmunmap(p->pagetable, fb_va_by_pid[idx], GPU_FB_PAGES, 0);
     fb_va_by_pid[idx] = 0;
+  }
+
+  // Restore GPU backing to kernel fb[] so the device does not keep reading
+  // freed user pages after this process dies.
+  if (flip_done_by_pid[idx]) {
+    virtio_gpu_restore_fb();
+    flip_done_by_pid[idx] = 0;
   }
 
   exit(n);
@@ -115,12 +132,32 @@ sys_uptime(void)
 // that is exactly GPU_FB_PAGES (300) * PGSIZE bytes (i.e. 640x480x4 =
 // 1,228,800 bytes).  The buffer must already be fully mapped in the
 // calling process's address space.
-//
-// TODO: Students implement this syscall.
 uint64
 sys_flip_display(void)
 {
-  return -1;
+  uint64 buf;
+  struct proc *p = myproc();
+
+  argaddr(0, &buf);
+
+  // Buffer must be page-aligned.
+  if (buf % PGSIZE != 0)
+    return -1;
+
+  // Walk the page table page-by-page to collect physical addresses.
+  // walkaddr() returns 0 for any page that is not present or not
+  // accessible to user space (PTE_V and PTE_U must both be set).
+  for (int i = 0; i < GPU_FB_PAGES; i++) {
+    uint64 pa = walkaddr(p->pagetable, buf + (uint64)i * PGSIZE);
+    if (pa == 0)
+      return -1;
+    flip_phys_buf[i] = pa;
+  }
+
+  // Re-point the GPU device's backing list to the user's physical pages.
+  virtio_gpu_flip(flip_phys_buf, GPU_FB_PAGES);
+  flip_done_by_pid[p->pid % NPROC] = 1;
+  return 0;
 }
 
 // sys_map_display: map the GPU's kernel framebuffer pages (fb[]) directly

@@ -134,6 +134,12 @@ struct virtio_gpu_resource_detach_backing
 // can coexist on multi-CPU systems.
 static struct spinlock gpu_lock;
 
+// Serialises flip_entries[] across concurrent virtio_gpu_flip / restore calls.
+static struct spinlock flip_lock;
+
+// Entry buffer for page-flip operations — avoids a ~4800-byte stack alloc.
+static struct virtio_gpu_mem_entry flip_entries[FB_PAGES];
+
 static struct
 {
     struct virtq_desc *desc;
@@ -422,6 +428,7 @@ void virtio_gpu_init(void)
 {
     uint32 status = 0;
     initlock(&gpu_lock, "vgpu");
+    initlock(&flip_lock, "vgpu_flip");
 
     // ── 1. VirtIO device handshake ──────────────────────────────────────
     if (*R1(VIRTIO_MMIO_MAGIC_VALUE) != 0x74726976 ||
@@ -556,6 +563,42 @@ void **
 virtio_gpu_fb_pages(void)
 {
     return fb;
+}
+
+// Re-point the GPU resource's backing pages to the FB_PAGES physical
+// addresses in phys_addrs[], then immediately commit to the display.
+// The synchronous flush is necessary because user programs like show_flip
+// exit right after calling flip_display, before the daemon's next tick.
+void
+virtio_gpu_flip(uint64 *phys_addrs, int n)
+{
+    acquire(&flip_lock);
+    for (int i = 0; i < n; i++) {
+        flip_entries[i].addr    = phys_addrs[i];
+        flip_entries[i].length  = PGSIZE;
+        flip_entries[i].padding = 0;
+    }
+    gpu_cmd_detach();
+    gpu_cmd_attach(flip_entries, n);
+    gpu_transfer_flush();
+    release(&flip_lock);
+}
+
+// Restore the GPU resource's backing to the kernel framebuffer pages fb[].
+// Called from sys_exit when a process that used flip_display exits, so the
+// device does not keep reading freed user pages after the process dies.
+void
+virtio_gpu_restore_fb(void)
+{
+    acquire(&flip_lock);
+    for (int i = 0; i < FB_PAGES; i++) {
+        flip_entries[i].addr    = (uint64)fb[i];
+        flip_entries[i].length  = PGSIZE;
+        flip_entries[i].padding = 0;
+    }
+    gpu_cmd_detach();
+    gpu_cmd_attach(flip_entries, FB_PAGES);
+    release(&flip_lock);
 }
 
 // ── GPU daemon ────────────────────────────────────────────────────────
