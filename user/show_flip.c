@@ -202,5 +202,7 @@ int main(int argc, char *argv[])
         exit(1);
     }
 
+    sleep(30);
+
     exit(0);
 }

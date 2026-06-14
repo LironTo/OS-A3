@@ -130,9 +130,9 @@ struct virtio_gpu_resource_detach_backing
 
 #define GPU_NUM 8
 
-// Serialises all virtqueue operations so the daemon and user syscalls
-// can coexist on multi-CPU systems.
 static struct spinlock gpu_lock;
+static struct spinlock flip_lock;
+static struct virtio_gpu_mem_entry flip_entries[FB_PAGES];
 
 static struct
 {
@@ -422,6 +422,7 @@ void virtio_gpu_init(void)
 {
     uint32 status = 0;
     initlock(&gpu_lock, "vgpu");
+    initlock(&flip_lock, "vgpu_flip");
 
     // ── 1. VirtIO device handshake ──────────────────────────────────────
     if (*R1(VIRTIO_MMIO_MAGIC_VALUE) != 0x74726976 ||
@@ -546,6 +547,41 @@ void virtio_gpu_init(void)
 void virtio_gpu_commit(void)
 {
     gpu_transfer_flush();
+}
+
+void **
+virtio_gpu_fb_pages(void)
+{
+    return fb;
+}
+
+void
+virtio_gpu_flip(uint64 *phys_addrs, int n)
+{
+    acquire(&flip_lock);
+    for (int i = 0; i < n; i++) {
+        flip_entries[i].addr    = phys_addrs[i];
+        flip_entries[i].length  = PGSIZE;
+        flip_entries[i].padding = 0;
+    }
+    gpu_cmd_detach();
+    gpu_cmd_attach(flip_entries, n);
+    gpu_transfer_flush();
+    release(&flip_lock);
+}
+
+void
+virtio_gpu_restore_fb(void)
+{
+    acquire(&flip_lock);
+    for (int i = 0; i < FB_PAGES; i++) {
+        flip_entries[i].addr    = (uint64)fb[i];
+        flip_entries[i].length  = PGSIZE;
+        flip_entries[i].padding = 0;
+    }
+    gpu_cmd_detach();
+    gpu_cmd_attach(flip_entries, FB_PAGES);
+    release(&flip_lock);
 }
 
 // ── GPU daemon ────────────────────────────────────────────────────────
