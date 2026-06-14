@@ -6,11 +6,30 @@
 #include "spinlock.h"
 #include "proc.h"
 
+// Expose the kernel framebuffer page array from virtio_gpu.c.
+extern void **virtio_gpu_fb_pages(void);
+
+// Per-process record of where the GPU framebuffer is mapped, indexed by
+// pid % NPROC.  0 means the framebuffer is not mapped for that slot.
+// Used by sys_exit to unmap before the page table is freed.
+static uint64 fb_va_by_pid[NPROC];
+
 uint64
 sys_exit(void)
 {
   int n;
   argint(0, &n);
+
+  // Unmap the GPU framebuffer before the page table is freed so that
+  // freewalk() does not panic on the dangling leaf PTEs.  do_free=0
+  // because the pages are kernel-owned (fb[] in virtio_gpu.c).
+  struct proc *p = myproc();
+  int idx = p->pid % NPROC;
+  if (fb_va_by_pid[idx] != 0) {
+    uvmunmap(p->pagetable, fb_va_by_pid[idx], GPU_FB_PAGES, 0);
+    fb_va_by_pid[idx] = 0;
+  }
+
   exit(n);
   return 0;  // not reached
 }
@@ -111,10 +130,46 @@ sys_flip_display(void)
 //   Pass 0 to let the kernel auto-select the next available VA above p->sz.
 //
 // Returns the mapped virtual address on success, (uint64)-1 on failure.
-//
-// TODO: Students implement this syscall.
 uint64
 sys_map_display(void)
 {
-  return -1;
+  uint64 addr;
+  struct proc *p = myproc();
+
+  argaddr(0, &addr);
+
+  // User-supplied address must be page-aligned.
+  if (addr != 0 && addr % PGSIZE != 0)
+    return -1;
+
+  void **fb = virtio_gpu_fb_pages();
+  uint64 fb_size = (uint64)GPU_FB_PAGES * PGSIZE;
+
+  if (addr == 0) {
+    // Auto-select: first page-aligned VA above the heap.
+    addr = PGROUNDUP(p->sz);
+  }
+
+  // Verify [addr, addr+fb_size) does not overlap any existing mapping.
+  for (uint64 va = addr; va < addr + fb_size; va += PGSIZE) {
+    pte_t *pte = walk(p->pagetable, va, 0);
+    if (pte && (*pte & PTE_V))
+      return -1;
+  }
+
+  // Install one PTE per framebuffer page with user r/w permission.
+  for (int i = 0; i < GPU_FB_PAGES; i++) {
+    if (mappages(p->pagetable, addr + (uint64)i * PGSIZE, PGSIZE,
+                 (uint64)fb[i], PTE_U | PTE_R | PTE_W) != 0) {
+      // Undo any partial mapping; do_free=0, kernel owns these pages.
+      if (i > 0)
+        uvmunmap(p->pagetable, addr, i, 0);
+      return -1;
+    }
+  }
+
+  // Record the mapping so sys_exit can remove it before freewalk runs.
+  fb_va_by_pid[p->pid % NPROC] = addr;
+
+  return addr;
 }

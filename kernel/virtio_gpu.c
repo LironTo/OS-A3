@@ -548,6 +548,16 @@ void virtio_gpu_commit(void)
     gpu_transfer_flush();
 }
 
+// ── Public: return the array of kernel framebuffer page pointers ──────
+// Each fb[i] is a kernel virtual address of one 4 KB page; there are
+// GPU_FB_PAGES (300) of them.  sys_map_display uses this to install the
+// pages into a user process's page table.
+void **
+virtio_gpu_fb_pages(void)
+{
+    return fb;
+}
+
 // ── GPU daemon ────────────────────────────────────────────────────────
 // Kernel process started by kproc_create().  Wakes every DISPLAY_DAEMON_TICKS
 // timer ticks and issues TRANSFER_TO_HOST_2D + RESOURCE_FLUSH so that
